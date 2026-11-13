@@ -1,0 +1,13 @@
+# Evening crossing. name;class;sins;coin;flags
+# classes: M mortal, H hero, P poet, K king, T publican
+Achilles;H;1200;a11c37a;0
+Orpheus;P;40;e0d1cba;4
+Midas;K;3100;c01d00c0;2
+Sisyphus;M;8800;b0c0d02;0
+Elpenor;M;310;e1f7e;1
+Tantalus;K;9500;7a07a1e9;0
+Zacchaeus;T;2600;c0de03;0
+Sappho;P;150;5a770065;0
+Eurydice;M;12;e0e0e0a4;6
+Autolycus;M;4999;beef42;0
+Nobody;X;0;422d;0

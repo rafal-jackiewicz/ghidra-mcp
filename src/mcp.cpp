@@ -1,3 +1,19 @@
+// Copyright 2026 Rafał Jackiewicz
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 #include "mcp.hpp"
 
 #include <nlohmann/json.hpp>
@@ -155,6 +171,27 @@ const std::vector<Tool>& tools() {
           {"comment", "string", "Comment text; empty clears the comment.", true},
           {"type", "string",
            "eol (default), pre (shown in the decompiler), post, plate or repeatable.", false}},
+         false, true},
+        {"define_type",
+         "Define a C structure, union, enum or typedef in the program so that function "
+         "signatures and the decompiler can use it. Returns the layout with field offsets.",
+         {{"declaration", "string",
+           "C declaration, e.g. \"struct Point { int x; int y; };\". Fixed-width names "
+           "such as uint8_t and uint32_t are understood.",
+           true}},
+         false, true},
+        {"set_variable_type",
+         "Give a parameter or local variable of a function a data type, for example a "
+         "structure created with define_type. Decompile again afterwards.",
+         {{"function", "string", "Function name or address.", true},
+          {"variable", "string", "Current variable name, as shown by decompile_function.", true},
+          {"type", "string", "Type, e.g. \"Passenger\", \"Passenger *\", \"char[24]\".", true}},
+         false, true},
+        {"set_data_type",
+         "Apply a data type to a global address, for example turn a block of bytes into an "
+         "array of structures so that code using it becomes readable.",
+         {{"address", "string", "Address (0x...) or symbol name of the data.", true},
+          {"type", "string", "Type, e.g. \"Record[64]\", \"uint\", \"char *[5]\".", true}},
          false, true},
         {"create_function",
          "Disassemble at an address and define a function there (useful for raw firmware).",

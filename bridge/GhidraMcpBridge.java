@@ -1,3 +1,19 @@
+// Copyright 2026 Rafał Jackiewicz
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+
 // Persistent command bridge used by the ghidra-mcp server. It is started by
 // ghidra-mcp through analyzeHeadless and is not meant to be run by hand.
 //
@@ -36,6 +52,7 @@ import ghidra.app.decompiler.DecompileOptions;
 import ghidra.app.decompiler.DecompileResults;
 import ghidra.app.plugin.core.analysis.AutoAnalysisManager;
 import ghidra.app.script.GhidraScript;
+import ghidra.app.util.cparser.C.CParser;
 import ghidra.app.util.importer.MessageLog;
 import ghidra.app.util.importer.ProgramLoader;
 import ghidra.app.util.opinion.BinaryLoader;
@@ -46,8 +63,15 @@ import ghidra.framework.model.DomainFile;
 import ghidra.framework.model.DomainFolder;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressSet;
+import ghidra.program.model.data.Composite;
+import ghidra.program.model.data.DataType;
+import ghidra.program.model.data.DataTypeComponent;
+import ghidra.program.model.data.DataTypeConflictHandler;
+import ghidra.program.model.data.DataTypeManager;
+import ghidra.program.model.data.DataUtilities;
 import ghidra.program.model.data.FunctionDefinitionDataType;
 import ghidra.program.model.data.StringDataInstance;
+import ghidra.program.model.data.TypeDef;
 import ghidra.program.model.lang.LanguageDescription;
 import ghidra.program.model.listing.CodeUnit;
 import ghidra.program.model.listing.CommentType;
@@ -75,6 +99,7 @@ import ghidra.program.model.symbol.SymbolType;
 import ghidra.program.util.DefaultLanguageService;
 import ghidra.program.util.DefinedStringIterator;
 import ghidra.program.util.GhidraProgramUtilities;
+import ghidra.util.data.DataTypeParser;
 
 public class GhidraMcpBridge extends GhidraScript {
 
@@ -245,6 +270,12 @@ public class GhidraMcpBridge extends GhidraScript {
 				return setComment(a);
 			case "create_function":
 				return createFunctionCmd(a);
+			case "define_type":
+				return defineType(a);
+			case "set_variable_type":
+				return setVariableType(a);
+			case "set_data_type":
+				return setDataType(a);
 			default:
 				throw new UserError("Unknown command: " + cmd);
 		}
@@ -924,22 +955,51 @@ public class GhidraMcpBridge extends GhidraScript {
 		Program p = prog(a);
 		Address target = addr(p, req(a, "address"));
 		Pager pg = new Pager(a);
+		Set<String> seen = new java.util.HashSet<>();
+		List<Address> hops = new ArrayList<>();
+
+		// A function may be reached through thunks (PLT stubs, import jump stubs): calls to
+		// those stubs are calls to the function, so they are followed as well.
+		Function fn = p.getFunctionManager().getFunctionAt(target);
+		if (fn == null) {
+			Symbol sym = p.getSymbolTable().getPrimarySymbol(target);
+			if (sym != null && sym.getObject() instanceof Function) {
+				fn = (Function) sym.getObject();
+			}
+		}
+		if (fn != null) {
+			Address[] thunks = fn.getFunctionThunkAddresses(true);
+			if (thunks != null) {
+				for (Address t : thunks) {
+					hops.add(t);
+				}
+			}
+		}
+
 		ReferenceIterator it = p.getReferenceManager().getReferencesTo(target);
 		while (it.hasNext()) {
 			Reference r = it.next();
 			Address from = r.getFromAddress();
-			pg.add(from + "  " + r.getReferenceType() + where(p, from));
-			// An imported function is reached through a pointer (import table) or a thunk;
-			// follow that one hop so the real call sites are listed too.
-			if (target.isExternalAddress() && from.isMemoryAddress()) {
-				Function thunk = p.getFunctionManager().getFunctionAt(from);
-				Address hop = thunk != null ? thunk.getEntryPoint() : from;
-				ReferenceIterator via = p.getReferenceManager().getReferencesTo(hop);
-				while (via.hasNext()) {
-					Reference v = via.next();
-					pg.add("  " + v.getFromAddress() + "  " + v.getReferenceType() +
-						where(p, v.getFromAddress()) + "  (via " + hop + ")");
+			if (seen.add(from.toString())) {
+				pg.add(from + "  " + r.getReferenceType() + where(p, from));
+			}
+			// An imported function is also reached through its import-table slot.
+			if (target.isExternalAddress() && from.isMemoryAddress() && !hops.contains(from)) {
+				hops.add(from);
+			}
+		}
+		for (Address hop : hops) {
+			ReferenceIterator via = p.getReferenceManager().getReferencesTo(hop);
+			while (via.hasNext()) {
+				Reference v = via.next();
+				Address from = v.getFromAddress();
+				Function holder = p.getFunctionManager().getFunctionContaining(from);
+				if (holder == null || holder.isThunk() || hops.contains(from) ||
+					!seen.add(from.toString())) {
+					continue; // table entries, the stub itself, or already listed
 				}
+				pg.add("  " + from + "  " + v.getReferenceType() + where(p, from) + "  (via " +
+					hop + ")");
 			}
 		}
 		return pg.finish("references to " + target);
@@ -1211,6 +1271,129 @@ public class GhidraMcpBridge extends GhidraScript {
 			}
 			AutoAnalysisManager.getAnalysisManager(p).startAnalysis(monitor);
 			return "Function " + fnLine(f) + " (" + f.getBody().getNumAddresses() + " bytes)";
+		});
+	}
+
+	// Fixed-width integer names are not part of C itself; make them available to declarations.
+	private static final String STDINT =
+		"typedef unsigned char uint8_t; typedef signed char int8_t; " +
+			"typedef unsigned short uint16_t; typedef short int16_t; " +
+			"typedef unsigned int uint32_t; typedef int int32_t; " +
+			"typedef unsigned long long uint64_t; typedef long long int64_t;\n";
+
+	private String defineType(Map<String, String> a) throws Exception {
+		Program p = prog(a);
+		String decl = req(a, "declaration").trim();
+		if (!decl.endsWith(";")) {
+			decl += ";";
+		}
+		DataTypeManager dtm = p.getDataTypeManager();
+		DataType parsed;
+		try {
+			parsed = new CParser(dtm, false, null).parse(STDINT + decl);
+		}
+		catch (Throwable t) {
+			String msg = t.getMessage() == null ? t.toString() : t.getMessage();
+			throw new UserError("Cannot parse the declaration: " + msg.split("\n")[0] +
+				"\nUse plain C, e.g. \"struct Point { int x; int y; };\" or " +
+				"\"typedef struct { char name[24]; uint16_t count; } Item;\".");
+		}
+		if (parsed == null) {
+			throw new UserError("The declaration defines no type. Use plain C, e.g. " +
+				"\"struct Point { int x; int y; };\".");
+		}
+		final DataType toStore = parsed;
+		return modify(p, "define type", () -> {
+			DataType dt = dtm.addDataType(toStore, DataTypeConflictHandler.REPLACE_HANDLER);
+			StringBuilder sb = new StringBuilder();
+			sb.append("Defined ").append(dt.getName()).append(" (").append(dt.getLength())
+					.append(" bytes)");
+			DataType base = dt instanceof TypeDef ? ((TypeDef) dt).getBaseDataType() : dt;
+			if (base instanceof Composite) {
+				sb.append("\noffset  size  field");
+				for (DataTypeComponent c : ((Composite) base).getDefinedComponents()) {
+					sb.append(String.format("%n0x%02x    %4d  %s %s", c.getOffset(), c.getLength(),
+						c.getDataType().getDisplayName(),
+						c.getFieldName() == null ? "(unnamed)" : c.getFieldName()));
+				}
+			}
+			sb.append("\nUse it in set_function_signature, e.g. \"int f(").append(dt.getName())
+					.append(" *p)\".");
+			return sb.toString();
+		});
+	}
+
+	private DataType parseType(Program p, String text) {
+		try {
+			DataTypeManager dtm = p.getDataTypeManager();
+			return new DataTypeParser(dtm, dtm, null, DataTypeParser.AllowedDataTypes.ALL)
+					.parse(text.trim());
+		}
+		catch (Exception e) {
+			throw new UserError("Unknown type '" + text + "'. Use a C base type (char, int, " +
+				"unsigned int, ...), a Ghidra name (uchar, ushort, uint, ulong) or a type created " +
+				"with define_type, optionally followed by * or [n], e.g. \"Record[64]\".");
+		}
+	}
+
+	private String setVariableType(Map<String, String> a) throws Exception {
+		Program p = prog(a);
+		Function f = func(p, req(a, "function"));
+		String name = req(a, "variable");
+		DataType dt = parseType(p, req(a, "type"));
+		String done = name + " in " + f.getName() + " is now " + dt.getDisplayName() + " (" +
+			dt.getLength() + " bytes). Decompile again to see the effect.";
+		for (Variable v : f.getAllVariables()) {
+			if (v.getName().equals(name)) {
+				return modify(p, "set variable type", () -> {
+					v.setDataType(dt, false, true, SourceType.USER_DEFINED);
+					return done;
+				});
+			}
+		}
+		HighFunction hf = decompileFn(p, f, 60).getHighFunction();
+		Iterator<HighSymbol> it = hf.getLocalSymbolMap().getSymbols();
+		StringBuilder names = new StringBuilder();
+		while (it.hasNext()) {
+			HighSymbol sym = it.next();
+			if (sym.getName().equals(name)) {
+				return modify(p, "set variable type", () -> {
+					if (sym.isParameter()) {
+						HighFunctionDBUtil.commitParamsToDatabase(hf, true,
+							ReturnCommitOption.NO_COMMIT, SourceType.ANALYSIS);
+						for (Parameter prm : f.getParameters()) {
+							if (prm.getOrdinal() == sym.getCategoryIndex()) {
+								prm.setDataType(dt, false, true, SourceType.USER_DEFINED);
+							}
+						}
+					}
+					else {
+						HighFunctionDBUtil.updateDBVariable(sym, null, dt, SourceType.USER_DEFINED);
+					}
+					return done;
+				});
+			}
+			names.append(names.length() == 0 ? "" : ", ").append(sym.getName());
+		}
+		throw new UserError("No variable '" + name + "' in " + f.getName() + ". Variables: " +
+			names);
+	}
+
+	private String setDataType(Map<String, String> a) throws Exception {
+		Program p = prog(a);
+		Address ad = addr(p, req(a, "address"));
+		DataType dt = parseType(p, req(a, "type"));
+		return modify(p, "set data type", () -> {
+			try {
+				DataUtilities.createData(p, ad, dt, -1,
+					DataUtilities.ClearDataMode.CLEAR_ALL_CONFLICT_DATA);
+			}
+			catch (Exception e) {
+				throw new UserError("Cannot apply " + dt.getDisplayName() + " at " + ad + ": " +
+					e.getMessage());
+			}
+			return "Applied " + dt.getDisplayName() + " at " + ad + " (" + dt.getLength() +
+				" bytes).";
 		});
 	}
 }
