@@ -1,0 +1,9 @@
+build/
+cmake-build-*/
+.idea/
+examples/build/
+
+# Documentation is kept out of the repository
+docs/
+GHIDRA.md
+README.md
