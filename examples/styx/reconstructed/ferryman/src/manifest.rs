@@ -20,7 +20,7 @@
 //! `sscanf(line, " %23[^;];%c;%u;%x;%u", ...)`. Those two calls *are* the file format:
 //! what they accept, the format accepts. This module therefore follows them step by step
 //! instead of using a tidy split-and-parse, which was tried first and differed from the
-//! original on 263 of 304 test manifests.
+//! original on 267 of 304 test manifests.
 
 use obol::Passenger;
 

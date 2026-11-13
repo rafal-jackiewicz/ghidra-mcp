@@ -21,6 +21,7 @@
 
 mod ledger;
 mod manifest;
+mod textmode;
 
 use std::io::{self, Write};
 use std::process::ExitCode;
@@ -66,11 +67,12 @@ fn refusal_line(name: &[u8], reason: &str) -> Vec<u8> {
 
 fn board(manifest_path: &str, ledger_path: &str) -> io::Result<u8> {
     let Ok(text) = std::fs::read(manifest_path) else {
-        eprintln!("ferryman: cannot read manifest {manifest_path}");
+        textmode::complain(&format!("ferryman: cannot read manifest {manifest_path}"));
         return Ok(exit::IO);
     };
+    let text = textmode::input(text); // the original opens the manifest in text mode
 
-    let mut out = io::stdout().lock();
+    let mut out = textmode::Stdout::new();
     let mut records: Vec<Record> = Vec::new();
     let mut refused = 0u32;
     let mut total = 0u32;
@@ -81,7 +83,7 @@ fn board(manifest_path: &str, ledger_path: &str) -> io::Result<u8> {
         }
         let Some(passenger) = manifest::parse(line) else {
             out.flush()?;
-            eprintln!("line {number}: unreadable, skipped");
+            textmode::complain(&format!("line {number}: unreadable, skipped"));
             continue;
         };
         let name = passenger.name_bytes();
@@ -106,7 +108,7 @@ fn board(manifest_path: &str, ledger_path: &str) -> io::Result<u8> {
 
     if std::fs::write(ledger_path, ledger::encode(&records, total)).is_err() {
         out.flush()?;
-        eprintln!("ferryman: cannot write ledger {ledger_path}");
+        textmode::complain(&format!("ferryman: cannot write ledger {ledger_path}"));
         return Ok(exit::IO);
     }
     writeln!(out, "{} boarded, {refused} refused, {total} oboli collected", records.len())?;
@@ -115,13 +117,13 @@ fn board(manifest_path: &str, ledger_path: &str) -> io::Result<u8> {
 
 fn audit(ledger_path: &str) -> io::Result<u8> {
     let Ok(bytes) = std::fs::read(ledger_path) else {
-        eprintln!("ferryman: cannot read ledger {ledger_path}");
+        textmode::complain(&format!("ferryman: cannot read ledger {ledger_path}"));
         return Ok(exit::IO);
     };
     let (records, total) = match ledger::decode(&bytes) {
         Ok(contents) => contents,
         Err(problem) => {
-            eprintln!("ferryman: {problem}");
+            textmode::complain(&format!("ferryman: {problem}"));
             return Ok(match problem {
                 ledger::Problem::Tampered => exit::TAMPERED,
                 _ => exit::BAD_LEDGER,
@@ -129,7 +131,7 @@ fn audit(ledger_path: &str) -> io::Result<u8> {
         }
     };
 
-    let mut out = io::stdout().lock();
+    let mut out = textmode::Stdout::new();
     let mut sum = 0u32;
     for record in &records {
         let p = &record.passenger;
@@ -139,11 +141,18 @@ fn audit(ledger_path: &str) -> io::Result<u8> {
     }
     if sum != total {
         out.flush()?;
-        eprintln!("ferryman: totals do not agree, someone is skimming");
+        textmode::complain("ferryman: totals do not agree, someone is skimming");
         return Ok(exit::TAMPERED);
     }
     writeln!(out, "{} souls, {sum} oboli", records.len())?;
     Ok(0)
+}
+
+fn usage() -> io::Result<u8> {
+    let mut out = textmode::Stdout::new();
+    writeln!(out, "usage: ferryman board MANIFEST LEDGER")?;
+    writeln!(out, "       ferryman audit LEDGER")?;
+    Ok(exit::USAGE)
 }
 
 fn main() -> ExitCode {
@@ -152,16 +161,12 @@ fn main() -> ExitCode {
     let result = match args[1..] {
         ["board", manifest, ledger] => board(manifest, ledger),
         ["audit", ledger] => audit(ledger),
-        _ => {
-            println!("usage: ferryman board MANIFEST LEDGER");
-            println!("       ferryman audit LEDGER");
-            Ok(exit::USAGE)
-        }
+        _ => usage(),
     };
     match result {
         Ok(code) => ExitCode::from(code),
         Err(error) => {
-            eprintln!("ferryman: {error}");
+            textmode::complain(&format!("ferryman: {error}"));
             ExitCode::from(exit::IO)
         }
     }

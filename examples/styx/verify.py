@@ -82,6 +82,7 @@ AWKWARD = [
     "BigFlags;M;10;a11c37a;4294967295",
     "Semicolons;;;;",
     "LongLine;M;10;a11c37a;0" + " " * 150 + "tail;M;1;a11c37a;0",  # longer than the read buffer
+    "Sub\x1astitute;M;10;a11c37a;0",              # Ctrl-Z: an ordinary byte on Linux, end of file on Windows
 ]
 
 
@@ -116,6 +117,9 @@ def describe(a, b):
             continue
         if not isinstance(x, bytes) or not isinstance(y, bytes):
             return f"{label}: original {x!r}, reconstruction {y!r}"
+        if label != "ledger" and x.replace(b"\r\n", b"\n") == y.replace(b"\r\n", b"\n"):
+            ends = lambda data: "CR LF" if b"\r\n" in data else "LF"
+            return f"{label}: same text, different line ends (original {ends(x)}, reconstruction {ends(y)})"
         xs, ys = x.splitlines(), y.splitlines()
         for i in range(max(len(xs), len(ys))):
             lx = xs[i] if i < len(xs) else b"<nothing>"
