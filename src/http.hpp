@@ -29,7 +29,8 @@ struct HttpConfig {
     std::string host = "127.0.0.1";
     int port = 8765;
     std::string endpoint = "/ghidra-mcp";  // URL path of the MCP endpoint; prefix of all others
-    std::string token;                    // if set, required as "Authorization: Bearer <token>"
+    // Accepted bearer tokens as (user name, token). Empty: no authentication.
+    std::vector<std::pair<std::string, std::string>> users;
     uint64_t maxUploadBytes = 2048ull << 20;
 };
 

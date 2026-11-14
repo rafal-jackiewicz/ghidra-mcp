@@ -88,6 +88,8 @@ bool isLoopbackName(const std::string& h) {
 
 struct HttpServer::Request {
     std::string method, path, query, version;
+    std::string user = "anonymous";  // name of the token that authorised the request
+    std::string peer;                // remote address
     std::map<std::string, std::string> headers;  // lower-case names
     std::string body;
     bool keepAlive = true;
@@ -293,10 +295,18 @@ void HttpServer::serve(int fd) {
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rcv, sizeof rcv);
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &snd, sizeof snd);
 
+    char peer[NI_MAXHOST] = "";
+    struct sockaddr_storage addr;
+    socklen_t addrLen = sizeof addr;
+    if (getpeername(fd, reinterpret_cast<struct sockaddr*>(&addr), &addrLen) == 0)
+        getnameinfo(reinterpret_cast<struct sockaddr*>(&addr), addrLen, peer, sizeof peer, nullptr, 0,
+                    NI_NUMERICHOST);
+
     Conn c(fd);
     for (;;) {
         Request r;
         if (!c.readHead(r)) break;
+        r.peer = peer;
         logDebug("http %s %s", r.method.c_str(), r.path.c_str());
         bool keep;
         try {
@@ -348,12 +358,20 @@ bool HttpServer::handle(Conn& c, Request& r) {
             return c.text(403, "Forbidden", "cross-origin requests are not allowed", false);
     }
 
-    if (!cfg_.token.empty()) {
+    if (!cfg_.users.empty()) {
         std::string auth = r.header("authorization");
         std::string given = auth.size() > 7 && lowerCase(auth.substr(0, 7)) == "bearer "
                                 ? trim(auth.substr(7))
                                 : "";
-        if (!util::constantTimeEquals(given, cfg_.token))
+        bool known = false;
+        for (const auto& user : cfg_.users) {  // compare against every token: no early exit
+            if (util::constantTimeEquals(given, user.second) && !known) {
+                known = true;
+                r.user = user.first;
+            }
+        }
+        if (!known) mcp_.audit.denied(r.peer);
+        if (!known)
             return c.respond(401, "Unauthorized", "text/plain", "missing or wrong bearer token\n",
                              false, "WWW-Authenticate: Bearer\r\n");
     }
@@ -371,7 +389,7 @@ bool HttpServer::handle(Conn& c, Request& r) {
         });
         if (rc) return c.text(rc, rc == 413 ? "Payload Too Large" : "Bad Request",
                               "bad request body", false);
-        std::string out = mcp_.handle(r.body, baseUrl(r));
+        std::string out = mcp_.handle(r.body, baseUrl(r), CallContext{r.user, r.peer});
         if (out.empty()) return c.respond(202, "Accepted", "", "", keep);
         return c.respond(200, "OK", "application/json", out, keep);
     }
@@ -481,7 +499,7 @@ bool HttpServer::handleSseMessage(Conn& c, Request& r) {
     if (!session) return c.text(404, "Not Found", "unknown SSE session", r.keepAlive);
 
     bool keep = c.respond(202, "Accepted", "text/plain", "Accepted\n", r.keepAlive);
-    std::string out = mcp_.handle(r.body, baseUrl(r));
+    std::string out = mcp_.handle(r.body, baseUrl(r), CallContext{r.user, r.peer});
     if (!out.empty()) sseEvent(*session, "event: message\ndata: " + out + "\n\n");
     return keep;
 }

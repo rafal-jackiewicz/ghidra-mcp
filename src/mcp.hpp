@@ -20,6 +20,7 @@
 #include <mutex>
 #include <string>
 
+#include "audit.hpp"
 #include "bridge.hpp"
 
 struct McpConfig {
@@ -37,7 +38,11 @@ public:
     // Handles one JSON-RPC message (or batch). Returns the serialized response, or an empty
     // string when the message needs no response (notifications). baseUrl is the URL the
     // client used to reach this server (e.g. "http://10.0.2.2:8765"); may be empty.
-    std::string handle(const std::string& body, const std::string& baseUrl);
+    std::string handle(const std::string& body, const std::string& baseUrl,
+                       const CallContext& ctx = CallContext());
+
+    // Every tool call is recorded here when the log is open (see --audit-log).
+    AuditLog audit;
 
     // Redeems an upload ticket created by the prepare_upload tool. On success fills
     // destPath with the file the upload must be written to.

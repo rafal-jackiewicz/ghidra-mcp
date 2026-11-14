@@ -30,6 +30,7 @@
 #include <thread>
 
 #include "bridge.hpp"
+#include "audit.hpp"
 #include "http.hpp"
 #include "mcp.hpp"
 #include "registrar.hpp"
@@ -53,6 +54,8 @@ static void usage(FILE* out, const char* argv0) {
 "  -t, --token TOKEN        require \"Authorization: Bearer TOKEN\" from clients\n"
 "                           (default: $GHIDRA_MCP_TOKEN; recommended with --host 0.0.0.0)\n"
 "  -e, --endpoint PATH      URL path of the MCP endpoint (default /ghidra-mcp)\n"
+"      --token-file FILE    several tokens, one per person: lines of NAME:TOKEN. The name\n"
+"                           appears in the audit log\n"
 "      --stdio              speak MCP over stdin/stdout instead of HTTP\n"
 "\n"
 "Ghidra:\n"
@@ -78,6 +81,12 @@ static void usage(FILE* out, const char* argv0) {
 "      --url URL            URL to register (default: http://127.0.0.1:PORT/ENDPOINT built\n"
 "                           from --host/--port/--endpoint)\n"
 "      --dry-run            show what --register/--unregister would change\n"
+"\n"
+"Accountability:\n"
+"      --audit-log FILE     append a record of every tool call (who, when, which tool,\n"
+"                           arguments, digest of the result) to FILE; the records are\n"
+"                           chained by hashes so that tampering can be detected\n"
+"      --verify-audit FILE  check such a file and exit\n"
 "\n"
 "General:\n"
 "  -v, --verbose            log requests and bridge traffic to stderr\n"
@@ -116,7 +125,7 @@ static bool isLoopback(const std::string& host) {
 int main(int argc, char** argv) {
     HttpConfig http;
     BridgeConfig bridgeCfg;
-    std::string uploadDir;
+    std::string uploadDir, auditPath, tokenFile, verifyPath, cliToken;
     bool stdio = false, lazy = false;
     enum class Action { Serve, Register, Unregister, ListHarnesses } action = Action::Serve;
     std::string harnessList;
@@ -124,7 +133,7 @@ int main(int argc, char** argv) {
     long maxUploadMb = 2048;
 
     const char* env;
-    if ((env = getenv("GHIDRA_MCP_TOKEN"))) http.token = env;
+    if ((env = getenv("GHIDRA_MCP_TOKEN"))) cliToken = env;
     if ((env = getenv("GHIDRA_INSTALL_DIR"))) bridgeCfg.ghidraHome = env;
     if ((env = getenv("JAVA_HOME"))) bridgeCfg.javaHome = env;
     bridgeCfg.projectDir = util::homeDir() + "/ghidra-projects";
@@ -132,7 +141,8 @@ int main(int argc, char** argv) {
 
     enum {
         OPT_STDIO = 1000, OPT_UPLOAD_DIR, OPT_MAX_UPLOAD, OPT_TIMEOUT, OPT_LAZY, OPT_REGISTER,
-        OPT_UNREGISTER, OPT_HARNESSES, OPT_NAME, OPT_URL, OPT_DRY_RUN
+        OPT_UNREGISTER, OPT_HARNESSES, OPT_NAME, OPT_URL, OPT_DRY_RUN, OPT_AUDIT, OPT_TOKEN_FILE,
+        OPT_VERIFY_AUDIT
     };
     static const struct option longOpts[] = {
         {"port", required_argument, nullptr, 'p'},
@@ -154,6 +164,9 @@ int main(int argc, char** argv) {
         {"name", required_argument, nullptr, OPT_NAME},
         {"url", required_argument, nullptr, OPT_URL},
         {"dry-run", no_argument, nullptr, OPT_DRY_RUN},
+        {"audit-log", required_argument, nullptr, OPT_AUDIT},
+        {"token-file", required_argument, nullptr, OPT_TOKEN_FILE},
+        {"verify-audit", required_argument, nullptr, OPT_VERIFY_AUDIT},
         {"verbose", no_argument, nullptr, 'v'},
         {"version", no_argument, nullptr, 'V'},
         {"help", no_argument, nullptr, 'h'},
@@ -175,7 +188,7 @@ int main(int argc, char** argv) {
         switch (opt) {
             case 'p': http.port = static_cast<int>(number(optarg, "port", 1, 65535)); break;
             case 'H': http.host = optarg; break;
-            case 't': http.token = optarg; break;
+            case 't': cliToken = optarg; break;
             case 'e': http.endpoint = optarg; break;
             case OPT_STDIO: stdio = true; break;
             case 'g': bridgeCfg.ghidraHome = optarg; break;
@@ -202,6 +215,9 @@ int main(int argc, char** argv) {
             case OPT_NAME: reg.name = optarg; break;
             case OPT_URL: reg.url = optarg; break;
             case OPT_DRY_RUN: reg.dryRun = true; break;
+            case OPT_AUDIT: auditPath = optarg; break;
+            case OPT_TOKEN_FILE: tokenFile = optarg; break;
+            case OPT_VERIFY_AUDIT: verifyPath = optarg; break;
             case 'v': util::verbose = true; break;
             case 'V': printf("ghidra-mcp %s\n", GHIDRA_MCP_VERSION); return 0;
             case 'h': usage(stdout, argv[0]); return 0;
@@ -214,6 +230,35 @@ int main(int argc, char** argv) {
         fprintf(stderr, "%s: unexpected argument '%s'\nTry '%s --help' for more information.\n",
                 argv[0], argv[optind], argv[0]);
         return 2;
+    }
+
+    if (!verifyPath.empty()) return AuditLog::verify(verifyPath);
+
+    // Tokens: --token gives the user "default"; a token file names one user per line.
+    if (!cliToken.empty()) http.users.emplace_back("default", cliToken);
+    if (!tokenFile.empty()) {
+        std::string text;
+        if (!util::readFile(tokenFile, text)) {
+            fprintf(stderr, "%s: cannot read token file %s\n", argv[0], tokenFile.c_str());
+            return 1;
+        }
+        size_t pos = 0;
+        int lineNo = 0;
+        while (pos < text.size()) {
+            size_t end = text.find('\n', pos);
+            std::string line = text.substr(pos, end == std::string::npos ? end : end - pos);
+            pos = end == std::string::npos ? text.size() : end + 1;
+            lineNo++;
+            while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+            if (line.empty() || line[0] == '#') continue;
+            size_t colon = line.find(':');
+            if (colon == std::string::npos || colon == 0 || colon + 1 >= line.size()) {
+                fprintf(stderr, "%s: %s line %d: expected NAME:TOKEN\n", argv[0], tokenFile.c_str(),
+                        lineNo);
+                return 2;
+            }
+            http.users.emplace_back(line.substr(0, colon), line.substr(colon + 1));
+        }
     }
 
     // Normalise the endpoint path: leading slash, no trailing slash, URL-safe characters.
@@ -234,7 +279,7 @@ int main(int argc, char** argv) {
         if (reg.url.empty())
             reg.url = "http://" + (host.find(':') != std::string::npos ? "[" + host + "]" : host) +
                       ":" + std::to_string(http.port) + http.endpoint;
-        reg.token = http.token;
+        reg.token = cliToken;
         if (action == Action::ListHarnesses) return listHarnesses(reg);
         return runRegistration(harnessList, action == Action::Unregister, reg);
     }
@@ -291,6 +336,14 @@ int main(int argc, char** argv) {
                                               : http.host) +
                              ":" + std::to_string(http.port);
     McpServer mcp(bridge, mcpCfg);
+    if (!auditPath.empty()) {
+        std::string err;
+        if (!mcp.audit.open(auditPath, err)) {
+            fprintf(stderr, "%s: %s\n", argv[0], err.c_str());
+            return 1;
+        }
+        mcp.audit.start(GHIDRA_MCP_VERSION, bridgeCfg.projectDir + "/" + bridgeCfg.projectName);
+    }
 
     util::logInfo("ghidra-mcp %s, Ghidra at %s", GHIDRA_MCP_VERSION,
                   bridgeCfg.ghidraHome.c_str());
@@ -305,7 +358,7 @@ int main(int argc, char** argv) {
         util::logInfo("listening on http://%s:%d%s (streamable HTTP) and %s/sse (legacy SSE)",
                       http.host.c_str(), http.port,
                       http.endpoint.empty() ? "/" : http.endpoint.c_str(), http.endpoint.c_str());
-        if (!isLoopback(http.host) && http.token.empty())
+        if (!isLoopback(http.host) && http.users.empty())
             util::logInfo("WARNING: reachable from the network without --token; anyone who can "
                           "connect can use Ghidra and upload files");
     }
@@ -323,7 +376,7 @@ int main(int argc, char** argv) {
         std::string line;
         while (!gStop && std::getline(std::cin, line)) {
             if (line.find_first_not_of(" \t\r") == std::string::npos) continue;
-            std::string out = mcp.handle(line, "");
+            std::string out = mcp.handle(line, "", CallContext{"stdio", ""});
             if (!out.empty()) {
                 fwrite(out.data(), 1, out.size(), stdout);
                 fputc('\n', stdout);

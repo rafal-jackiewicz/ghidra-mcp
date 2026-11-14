@@ -276,6 +276,8 @@ public class GhidraMcpBridge extends GhidraScript {
 				return setVariableType(a);
 			case "set_data_type":
 				return setDataType(a);
+			case "export_annotations":
+				return exportAnnotations(a);
 			default:
 				throw new UserError("Unknown command: " + cmd);
 		}
@@ -1305,6 +1307,12 @@ public class GhidraMcpBridge extends GhidraScript {
 		final DataType toStore = parsed;
 		return modify(p, "define type", () -> {
 			DataType dt = dtm.addDataType(toStore, DataTypeConflictHandler.REPLACE_HANDLER);
+			// Remember which types came from analysts, for export_annotations.
+			ghidra.framework.options.Options notes = p.getOptions("ghidra-mcp");
+			String known = notes.getString("defined types", "");
+			if (!("," + known + ",").contains("," + dt.getName() + ",")) {
+				notes.setString("defined types", known.isEmpty() ? dt.getName() : known + "," + dt.getName());
+			}
 			StringBuilder sb = new StringBuilder();
 			sb.append("Defined ").append(dt.getName()).append(" (").append(dt.getLength())
 					.append(" bytes)");
@@ -1395,5 +1403,118 @@ public class GhidraMcpBridge extends GhidraScript {
 			return "Applied " + dt.getDisplayName() + " at " + ad + " (" + dt.getLength() +
 				" bytes).";
 		});
+	}
+
+	/** Everything the analysts added to a program, as one report. */
+	private String exportAnnotations(Map<String, String> a) throws Exception {
+		Program p = prog(a);
+		Listing listing = p.getListing();
+		StringBuilder sb = new StringBuilder();
+		sb.append("ANNOTATIONS OF ").append(p.getDomainFile().getPathname()).append('\n');
+		sb.append("SHA-256 of the analysed file: ").append(p.getExecutableSHA256()).append('\n');
+		sb.append("Language: ").append(p.getLanguageID()).append("\n");
+
+		sb.append("\nFUNCTIONS (named or given a signature)\n");
+		int n = 0;
+		List<Function> touched = new ArrayList<>();
+		for (Function f : p.getFunctionManager().getFunctions(true)) {
+			boolean named = f.getSymbol().getSource() == SourceType.USER_DEFINED;
+			boolean typed = f.getSignatureSource() == SourceType.USER_DEFINED;
+			boolean vars = false;
+			for (Variable v : f.getAllVariables()) {
+				vars |= v.getSource() == SourceType.USER_DEFINED;
+			}
+			if (!named && !typed && !vars) {
+				continue;
+			}
+			touched.add(f);
+			sb.append(f.getEntryPoint()).append("  ").append(f.getPrototypeString(true, false))
+					.append('\n');
+			n++;
+		}
+		if (n == 0) {
+			sb.append("(none)\n");
+		}
+
+		sb.append("\nVARIABLES (renamed or retyped)\n");
+		n = 0;
+		for (Function f : touched) {
+			for (Variable v : f.getAllVariables()) {
+				if (v.getSource() == SourceType.USER_DEFINED && !(v instanceof Parameter)) {
+					sb.append(f.getName()).append(":  ").append(v.getDataType().getDisplayName())
+							.append(' ').append(v.getName()).append("  @ ")
+							.append(v.getVariableStorage()).append('\n');
+					n++;
+				}
+			}
+		}
+		if (n == 0) {
+			sb.append("(none)\n");
+		}
+
+		sb.append("\nLABELS\n");
+		n = 0;
+		for (Symbol sym : p.getSymbolTable().getAllSymbols(true)) {
+			if (sym.getSymbolType() == SymbolType.LABEL && sym.getSource() == SourceType.USER_DEFINED &&
+				sym.getAddress().isMemoryAddress()) {
+				Data d = listing.getDataAt(sym.getAddress());
+				sb.append(sym.getAddress()).append("  ").append(sym.getName());
+				if (d != null && d.isDefined()) {
+					sb.append("  : ").append(d.getDataType().getDisplayName());
+				}
+				sb.append('\n');
+				n++;
+			}
+		}
+		if (n == 0) {
+			sb.append("(none)\n");
+		}
+
+		sb.append("\nCOMMENTS\n");
+		n = 0;
+		for (Address ad : listing.getCommentAddressIterator(p.getMemory(), true)) {
+			for (CommentType type : CommentType.values()) {
+				String text = listing.getComment(type, ad);
+				if (text == null || text.isEmpty()) {
+					continue;
+				}
+				// Ghidra writes plate and end-of-line notes of its own; keep the ones in code we touched.
+				Function f = p.getFunctionManager().getFunctionContaining(ad);
+				if (type != CommentType.PRE && (f == null || !touched.contains(f))) {
+					continue;
+				}
+				sb.append(ad).append("  [").append(type.name().toLowerCase(Locale.ROOT)).append("]")
+						.append(f == null ? "" : "  in " + f.getName()).append("\n    ")
+						.append(text.replace("\n", "\n    ")).append('\n');
+				n++;
+			}
+		}
+		if (n == 0) {
+			sb.append("(none)\n");
+		}
+
+		sb.append("\nDATA TYPES (defined with define_type)\n");
+		n = 0;
+		DataTypeManager dtm = p.getDataTypeManager();
+		for (String name : p.getOptions("ghidra-mcp").getString("defined types", "").split(",")) {
+			DataType dt = name.isEmpty() ? null : dtm.getDataType("/" + name);
+			if (dt == null) {
+				continue;
+			}
+			sb.append(dt.getName()).append(" (").append(dt.getLength()).append(" bytes)\n");
+			DataType base = dt instanceof TypeDef ? ((TypeDef) dt).getBaseDataType() : dt;
+			if (base instanceof Composite) {
+				for (DataTypeComponent comp : ((Composite) base).getDefinedComponents()) {
+					sb.append(String.format("    0x%02x  %4d  %s %s%n", comp.getOffset(),
+						comp.getLength(), comp.getDataType().getDisplayName(),
+						comp.getFieldName() == null ? "(unnamed)" : comp.getFieldName()));
+				}
+			}
+			n++;
+		}
+		if (n == 0) {
+			sb.append("(none)\n");
+		}
+		return sb.toString().trim();
 	}
 }

@@ -42,6 +42,7 @@ file(WRITE ${GENERATED_DIR}/version.hpp
 
 add_executable(ghidra-mcp
   src/main.cpp
+  src/audit.cpp
   src/bridge.cpp
   src/http.cpp
   src/mcp.cpp

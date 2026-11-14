@@ -193,6 +193,11 @@ const std::vector<Tool>& tools() {
          {{"address", "string", "Address (0x...) or symbol name of the data.", true},
           {"type", "string", "Type, e.g. \"Record[64]\", \"uint\", \"char *[5]\".", true}},
          false, true},
+        {"export_annotations",
+         "Export everything that analysis has added to a program: functions that were named or "
+         "given a signature, labels, comments, renamed variables and defined structures, each "
+         "with its address. Use it as the analyst's notebook when writing a specification.",
+         {}, true, true},
         {"create_function",
          "Disassemble at an address and define a function there (useful for raw firmware).",
          {{"address", "string", "Entry address (0x...).", true},
@@ -252,6 +257,7 @@ std::string dump(const json& j) {
 struct McpDispatch {
     McpServer& s;
     const std::string& baseUrl;
+    const CallContext& ctx;
 
     std::string uploadBase() const { return baseUrl.empty() ? s.cfg_.fallbackBaseUrl : baseUrl; }
 
@@ -347,7 +353,19 @@ struct McpDispatch {
         return {{"tools", arr}};
     }
 
+    // Runs a tool and writes the call into the audit log.
     json callTool(const json& params) {
+        json result = runTool(params);
+        if (s.audit.enabled()) {
+            const json& content = result["content"][0]["text"];
+            s.audit.toolCall(ctx, params["name"].get<std::string>(),
+                             params.value("arguments", json::object()),
+                             result.value("isError", false), content.get<std::string>());
+        }
+        return result;
+    }
+
+    json runTool(const json& params) {
         if (!params.is_object() || !params.contains("name") || !params["name"].is_string())
             throw std::invalid_argument("tools/call requires a string 'name'");
         const std::string name = params["name"].get<std::string>();
@@ -442,11 +460,12 @@ struct McpDispatch {
 
 McpServer::McpServer(Bridge& bridge, McpConfig cfg) : bridge_(bridge), cfg_(std::move(cfg)) {}
 
-std::string McpServer::handle(const std::string& body, const std::string& baseUrl) {
+std::string McpServer::handle(const std::string& body, const std::string& baseUrl,
+                              const CallContext& ctx) {
     json msg = json::parse(body, nullptr, false);
     if (msg.is_discarded()) return dump(rpcError(nullptr, -32700, "Parse error"));
 
-    McpDispatch d{*this, baseUrl};
+    McpDispatch d{*this, baseUrl, ctx};
     json out;
     if (msg.is_array()) {
         if (msg.empty()) return dump(rpcError(nullptr, -32600, "Invalid Request"));
