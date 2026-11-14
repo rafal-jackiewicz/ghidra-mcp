@@ -19,6 +19,7 @@
 #include <getopt.h>
 #include <glob.h>
 #include <signal.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -60,7 +61,8 @@ static void usage(FILE* out, const char* argv0) {
 "\n"
 "Ghidra:\n"
 "  -g, --ghidra-home DIR    Ghidra installation (default: $GHIDRA_INSTALL_DIR, else the\n"
-"                           newest ~/ghidra-install/ghidra_*)\n"
+"                           highest version in ~/ghidra-install/ghidra_*,\n"
+"                           else /opt/ghidra*)\n"
 "  -j, --java-home DIR      JDK for Ghidra (default: $JAVA_HOME, else a JDK 21 in\n"
 "                           /usr/lib/jvm)\n"
 "  -d, --project-dir DIR    directory of the Ghidra project (default ~/ghidra-projects)\n"
@@ -110,8 +112,11 @@ static std::string newestMatch(const std::string& pattern) {
     glob_t g;
     std::string best;
     if (glob(pattern.c_str(), 0, nullptr, &g) == 0) {
+        // The highest version wins: 12.1.10 is newer than 12.1.4, whatever the alphabet says.
         for (size_t i = 0; i < g.gl_pathc; i++)
-            if (util::isDir(g.gl_pathv[i])) best = g.gl_pathv[i];  // glob sorts ascending
+            if (util::isDir(g.gl_pathv[i]) &&
+                (best.empty() || strverscmp(g.gl_pathv[i], best.c_str()) > 0))
+                best = g.gl_pathv[i];
     }
     globfree(&g);
     return best;
@@ -242,6 +247,10 @@ int main(int argc, char** argv) {
             fprintf(stderr, "%s: cannot read token file %s\n", argv[0], tokenFile.c_str());
             return 1;
         }
+        struct stat st {};
+        if (stat(tokenFile.c_str(), &st) == 0 && (st.st_mode & 077) != 0)
+            fprintf(stderr, "%s: warning: %s can be read by other users; chmod 600 it\n", argv[0],
+                    tokenFile.c_str());
         size_t pos = 0;
         int lineNo = 0;
         while (pos < text.size()) {

@@ -36,6 +36,7 @@ import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -426,8 +427,9 @@ public class GhidraMcpBridge extends GhidraScript {
 					"The Ghidra project is empty. Import a binary first with import_binary.");
 			}
 			else {
-				throw new UserError("No program is open. Call open_program first, or pass the " +
-					"'program' argument. Available programs:\n" + listPrograms());
+				throw new UserError("No program is selected: the project holds several and none is the " +
+					"current one. Call open_program first, or pass the 'program' argument. " +
+					"Programs in the project:\n" + listPrograms());
 			}
 		}
 		return current;
@@ -531,6 +533,29 @@ public class GhidraMcpBridge extends GhidraScript {
 	}
 
 	/** Runs a modification inside a transaction and saves the program when it succeeds. */
+	/** Notes in the program's own options which items analysts changed, for export_annotations. */
+	private static void remember(Program p, String key, String value) {
+		ghidra.framework.options.Options notes = p.getOptions("ghidra-mcp");
+		String known = notes.getString(key, "");
+		if (!("," + known + ",").contains("," + value + ",")) {
+			notes.setString(key, known.isEmpty() ? value : known + "," + value);
+		}
+	}
+
+	private static void touch(Program p, Function f) {
+		remember(p, "functions", f.getEntryPoint().toString());
+	}
+
+	private static Set<String> remembered(Program p, String key) {
+		Set<String> out = new HashSet<>();
+		for (String v : p.getOptions("ghidra-mcp").getString(key, "").split(",")) {
+			if (!v.isEmpty()) {
+				out.add(v);
+			}
+		}
+		return out;
+	}
+
 	private String modify(Program p, String what, Change c) throws Exception {
 		int tx = p.startTransaction("ghidra-mcp: " + what);
 		boolean ok = false;
@@ -810,14 +835,21 @@ public class GhidraMcpBridge extends GhidraScript {
 					.append('\n');
 		}
 		sb.append("Called by:\n");
-		for (Function c : f.getCallingFunctions(monitor)) {
+		for (Function c : byAddress(f.getCallingFunctions(monitor))) {
 			sb.append("  ").append(fnLine(c)).append('\n');
 		}
 		sb.append("Calls:\n");
-		for (Function c : f.getCalledFunctions(monitor)) {
+		for (Function c : byAddress(f.getCalledFunctions(monitor))) {
 			sb.append("  ").append(fnLine(c)).append('\n');
 		}
 		return sb.toString().trim();
+	}
+
+	/** Ghidra returns callers and callees as a hash set; list them in address order. */
+	private static List<Function> byAddress(Set<Function> functions) {
+		List<Function> sorted = new ArrayList<>(functions);
+		sorted.sort((x, y) -> x.getEntryPoint().compareTo(y.getEntryPoint()));
+		return sorted;
 	}
 
 	private String decompile(Map<String, String> a) throws Exception {
@@ -1131,6 +1163,7 @@ public class GhidraMcpBridge extends GhidraScript {
 		String name = req(a, "new_name");
 		String old = f.getName();
 		return modify(p, "rename function", () -> {
+			touch(p, f);
 			f.setName(name, SourceType.USER_DEFINED);
 			return "Renamed function " + old + " -> " + name + " @ " + f.getEntryPoint();
 		});
@@ -1144,6 +1177,7 @@ public class GhidraMcpBridge extends GhidraScript {
 		for (Variable v : f.getAllVariables()) {
 			if (v.getName().equals(oldName)) {
 				return modify(p, "rename variable", () -> {
+					touch(p, f);
 					v.setName(newName, SourceType.USER_DEFINED);
 					return "Renamed " + oldName + " -> " + newName + " in " + f.getName();
 				});
@@ -1157,6 +1191,7 @@ public class GhidraMcpBridge extends GhidraScript {
 			HighSymbol sym = it.next();
 			if (sym.getName().equals(oldName)) {
 				return modify(p, "rename variable", () -> {
+					touch(p, f);
 					if (sym.isParameter()) {
 						HighFunctionDBUtil.commitParamsToDatabase(hf, true,
 							ReturnCommitOption.NO_COMMIT, SourceType.ANALYSIS);
@@ -1193,6 +1228,7 @@ public class GhidraMcpBridge extends GhidraScript {
 				". Use C syntax such as \"int check_key(char *key, int len)\".");
 		}
 		return modify(p, "set signature", () -> {
+			touch(p, f);
 			// Without a concrete calling convention the decompiler cannot place the parameters.
 			if (Function.UNKNOWN_CALLING_CONVENTION_STRING.equals(f.getCallingConventionName())) {
 				f.setCallingConvention(
@@ -1247,6 +1283,7 @@ public class GhidraMcpBridge extends GhidraScript {
 		}
 		return modify(p, "set comment", () -> {
 			p.getListing().setComment(ad, type, text.isEmpty() ? null : text);
+			remember(p, "comments", ad + "/" + type.name());
 			return (text.isEmpty() ? "Cleared " : "Set ") + kind + " comment at " + ad;
 		});
 	}
@@ -1354,6 +1391,7 @@ public class GhidraMcpBridge extends GhidraScript {
 		for (Variable v : f.getAllVariables()) {
 			if (v.getName().equals(name)) {
 				return modify(p, "set variable type", () -> {
+					touch(p, f);
 					v.setDataType(dt, false, true, SourceType.USER_DEFINED);
 					return done;
 				});
@@ -1366,6 +1404,7 @@ public class GhidraMcpBridge extends GhidraScript {
 			HighSymbol sym = it.next();
 			if (sym.getName().equals(name)) {
 				return modify(p, "set variable type", () -> {
+					touch(p, f);
 					if (sym.isParameter()) {
 						HighFunctionDBUtil.commitParamsToDatabase(hf, true,
 							ReturnCommitOption.NO_COMMIT, SourceType.ANALYSIS);
@@ -1417,14 +1456,26 @@ public class GhidraMcpBridge extends GhidraScript {
 		sb.append("\nFUNCTIONS (named or given a signature)\n");
 		int n = 0;
 		List<Function> touched = new ArrayList<>();
+		// Functions changed through this server are noted in the program. Ghidra itself marks
+		// library prototypes and some variables as "user defined", so the source types alone
+		// would list functions nobody touched; they are used only for programs annotated
+		// before the notes existed.
+		Set<String> noted = remembered(p, "functions");
+		Set<String> notedComments = remembered(p, "comments");
+		boolean legacy = noted.isEmpty() && notedComments.isEmpty();
 		for (Function f : p.getFunctionManager().getFunctions(true)) {
-			boolean named = f.getSymbol().getSource() == SourceType.USER_DEFINED;
-			boolean typed = f.getSignatureSource() == SourceType.USER_DEFINED;
-			boolean vars = false;
-			for (Variable v : f.getAllVariables()) {
-				vars |= v.getSource() == SourceType.USER_DEFINED;
+			boolean named = f.getSymbol().getSource() == SourceType.USER_DEFINED && !f.isThunk();
+			if (legacy) {
+				boolean typed = f.getSignatureSource() == SourceType.USER_DEFINED;
+				boolean vars = false;
+				for (Variable v : f.getAllVariables()) {
+					vars |= v.getSource() == SourceType.USER_DEFINED;
+				}
+				if (!named && !typed && !vars) {
+					continue;
+				}
 			}
-			if (!named && !typed && !vars) {
+			else if (!named && !noted.contains(f.getEntryPoint().toString())) {
 				continue;
 			}
 			touched.add(f);
@@ -1480,7 +1531,8 @@ public class GhidraMcpBridge extends GhidraScript {
 				}
 				// Ghidra writes plate and end-of-line notes of its own; keep the ones in code we touched.
 				Function f = p.getFunctionManager().getFunctionContaining(ad);
-				if (type != CommentType.PRE && (f == null || !touched.contains(f))) {
+				if (legacy ? type != CommentType.PRE && (f == null || !touched.contains(f))
+						: !notedComments.contains(ad + "/" + type.name())) {
 					continue;
 				}
 				sb.append(ad).append("  [").append(type.name().toLowerCase(Locale.ROOT)).append("]")

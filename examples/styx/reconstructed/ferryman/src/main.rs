@@ -23,7 +23,9 @@ mod ledger;
 mod manifest;
 mod textmode;
 
+use std::ffi::OsString;
 use std::io::{self, Write};
+use std::path::Path;
 use std::process::ExitCode;
 
 use ledger::Record;
@@ -65,10 +67,24 @@ fn refusal_line(name: &[u8], reason: &str) -> Vec<u8> {
     line
 }
 
-fn board(manifest_path: &str, ledger_path: &str) -> io::Result<u8> {
-    let Ok(text) = std::fs::read(manifest_path) else {
-        textmode::complain(&format!("ferryman: cannot read manifest {manifest_path}"));
-        return Ok(exit::IO);
+/// The contents of a file, or `None` where the original's `fopen` fails. On Linux `fopen`
+/// succeeds on a directory and every read from it fails, so a directory counts as an empty
+/// file there; on Windows it cannot be opened at all.
+fn read_as_fopen(path: &Path) -> Option<Vec<u8>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Some(bytes),
+        Err(_) if cfg!(unix) && path.is_dir() => Some(Vec::new()),
+        Err(_) => None,
+    }
+}
+
+fn board(manifest_path: &Path, ledger_path: &Path) -> io::Result<u8> {
+    let text = match read_as_fopen(manifest_path) {
+        Some(text) => text,
+        None => {
+            textmode::complain(&format!("ferryman: cannot read manifest {}", manifest_path.display()));
+            return Ok(exit::IO);
+        }
     };
     let text = textmode::input(text); // the original opens the manifest in text mode
 
@@ -108,16 +124,16 @@ fn board(manifest_path: &str, ledger_path: &str) -> io::Result<u8> {
 
     if std::fs::write(ledger_path, ledger::encode(&records, total)).is_err() {
         out.flush()?;
-        textmode::complain(&format!("ferryman: cannot write ledger {ledger_path}"));
+        textmode::complain(&format!("ferryman: cannot write ledger {}", ledger_path.display()));
         return Ok(exit::IO);
     }
     writeln!(out, "{} boarded, {refused} refused, {total} oboli collected", records.len())?;
     Ok(0)
 }
 
-fn audit(ledger_path: &str) -> io::Result<u8> {
-    let Ok(bytes) = std::fs::read(ledger_path) else {
-        textmode::complain(&format!("ferryman: cannot read ledger {ledger_path}"));
+fn audit(ledger_path: &Path) -> io::Result<u8> {
+    let Some(bytes) = read_as_fopen(ledger_path) else {
+        textmode::complain(&format!("ferryman: cannot read ledger {}", ledger_path.display()));
         return Ok(exit::IO);
     };
     let (records, total) = match ledger::decode(&bytes) {
@@ -156,11 +172,11 @@ fn usage() -> io::Result<u8> {
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().collect();
-    let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let result = match args[1..] {
-        ["board", manifest, ledger] => board(manifest, ledger),
-        ["audit", ledger] => audit(ledger),
+    // File names are taken as the system gives them; they need not be valid UTF-8.
+    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    let result = match args.as_slice() {
+        [command, manifest, ledger] if command == "board" => board(Path::new(manifest), Path::new(ledger)),
+        [command, ledger] if command == "audit" => audit(Path::new(ledger)),
         _ => usage(),
     };
     match result {

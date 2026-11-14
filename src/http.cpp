@@ -84,6 +84,16 @@ bool isLoopbackName(const std::string& h) {
     return h == "localhost" || h == "127.0.0.1" || h == "[::1]";
 }
 
+// An address written as numbers: 10.0.2.2 or [fe80::1]. A browser that was tricked into
+// resolving an attacker's name to this machine (DNS rebinding) sends that name, never an address.
+bool isAddressLiteral(const std::string& h) {
+    if (h.empty()) return false;
+    if (h[0] == '[') return true;
+    for (char ch : h)
+        if (!(ch == '.' || (ch >= '0' && ch <= '9'))) return false;
+    return true;
+}
+
 }  // namespace
 
 struct HttpServer::Request {
@@ -348,14 +358,25 @@ bool HttpServer::handle(Conn& c, Request& r) {
     // Uploads are authorised by their single-use ticket (see prepare_upload).
     if (sub.compare(0, 8, "/upload/") == 0) return handleUpload(c, r, sub.substr(8));
 
-    // Browsers send Origin; refuse cross-site requests so a web page cannot drive Ghidra
-    // through the user's browser (DNS rebinding / CSRF).
+    // Browsers send Origin with every request a page can make to us; refuse them unless the
+    // page itself was served from this machine, so that a web site cannot drive Ghidra through
+    // the user's browser (CSRF). "null" is what sandboxed pages send, and is refused too.
     std::string origin = r.header("origin");
-    if (!origin.empty() && origin != "null") {
+    if (!origin.empty()) {
         size_t scheme = origin.find("://");
         std::string oh = hostOnly(scheme == std::string::npos ? origin : origin.substr(scheme + 3));
-        if (!isLoopbackName(oh) && oh != hostOnly(r.header("host")))
+        if (!isLoopbackName(oh))
             return c.text(403, "Forbidden", "cross-origin requests are not allowed", false);
+    }
+    // DNS rebinding: without a token, the server answers only when it was addressed by number
+    // or as localhost. With a token, the token is the protection and any host name will do.
+    if (cfg_.users.empty()) {
+        std::string hh = hostOnly(r.header("host"));
+        if (!hh.empty() && !isLoopbackName(hh) && !isAddressLiteral(hh))
+            return c.text(403, "Forbidden",
+                          "this server has no token, so it answers only to an IP address or "
+                          "'localhost' in the URL; start it with --token to use a host name",
+                          false);
     }
 
     if (!cfg_.users.empty()) {

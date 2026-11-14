@@ -250,6 +250,10 @@ mod tests {
         assert_eq!(fare(&passenger(0, 9000, 0)), Ok(22)); // surcharge is capped at 20
         assert_eq!(fare(&passenger(2, 99, 6)), Ok(0)); // poets with few sins travel free
         assert_eq!(fare(&passenger(2, 100, 0)), Ok(0));
+        assert_eq!(fare(&passenger(2, 99, 2)), Ok(0)); // the exemption ends at 100 sins:
+        assert_eq!(fare(&passenger(2, 100, 2)), Ok(1)); // only a flag makes the boundary visible
+        assert_eq!(fare(&passenger(0, 5249, 0)), Ok(22)); // 5249 / 250 = 20, the cap is not yet needed
+        assert_eq!(fare(&passenger(0, 5250, 0)), Ok(22)); // 21, capped
         assert_eq!(fare(&passenger(3, 3100, 2)), Ok(35)); // Midas, priority
         assert_eq!(fare(&passenger(0, 12, 6)), Ok(15)); // Eurydice, priority and return
     }

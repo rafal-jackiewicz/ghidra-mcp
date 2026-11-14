@@ -74,9 +74,12 @@ ordered_json entryGeminiLike(const RegisterOptions& o) {  // Gemini CLI and Qwen
     if (!o.token.empty()) e["headers"] = authHeaders(o);
     return e;
 }
+// opencode's current layout: mcp.servers.NAME, no "enabled" key, and remote servers try OAuth
+// unless told otherwise. Timeouts are per phase, in milliseconds.
 ordered_json entryOpencode(const RegisterOptions& o) {
-    ordered_json e = {{"type", "remote"}, {"url", o.url}, {"enabled", true}};
+    ordered_json e = {{"type", "remote"}, {"url", o.url}, {"oauth", false}};
     if (!o.token.empty()) e["headers"] = authHeaders(o);
+    e["timeout"] = {{"execution", kToolTimeoutSec * 1000}};
     return e;
 }
 ordered_json entryPi(const RegisterOptions& o) {
@@ -103,7 +106,7 @@ const Harness kHarnesses[] = {
     {"codex", "Codex CLI (OpenAI)", Kind::Toml, ".codex/config.toml", nullptr, ".codex", "codex",
      nullptr, nullptr},
     {"opencode", "opencode", Kind::Json, ".config/opencode/opencode.json",
-     ".config/opencode/opencode.jsonc", ".config/opencode", "opencode", "mcp", entryOpencode},
+     ".config/opencode/opencode.jsonc", ".config/opencode", "opencode", "mcp/servers", entryOpencode},
     {"hermes", "Hermes Agent", Kind::Yaml, ".hermes/config.yaml", nullptr, ".hermes", "hermes",
      nullptr, nullptr},
     {"pi", "Pi", Kind::Json, ".pi/agent/mcp.json", nullptr, ".pi", "pi", "mcpServers", entryPi},
@@ -231,22 +234,39 @@ Outcome editJson(const Harness& h, const std::string& path, bool unregister,
     bool comments;
     if (!loadJson(path, root, comments, note)) return Outcome::Failed;
 
-    const bool hasSection = root.contains(h.section) && root[h.section].is_object();
-    const bool present = hasSection && root[h.section].contains(opt.name);
+    // The section is one object ("mcpServers") or one inside another ("mcp/servers").
+    const std::string sectionPath = h.section;
+    const size_t slash = sectionPath.find('/');
+    const std::string outer = sectionPath.substr(0, slash);
+    const std::string inner = slash == std::string::npos ? "" : sectionPath.substr(slash + 1);
+    auto isObject = [](const ordered_json& j, const std::string& key) {
+        return j.contains(key) && j[key].is_object();
+    };
+    const bool hasOuter = isObject(root, outer);
+    const bool hasSection = inner.empty() ? hasOuter : hasOuter && isObject(root[outer], inner);
+    auto section = [&]() -> ordered_json& { return inner.empty() ? root[outer] : root[outer][inner]; };
+    const bool present = hasSection && section().contains(opt.name);
+    // An entry written in the harness's earlier layout, directly under the outer object
+    // (opencode before its "servers" level). It is replaced by, or removed with, the new one.
+    const bool legacy = !inner.empty() && hasOuter && opt.name != inner &&
+                        isObject(root[outer], opt.name) && root[outer][opt.name].contains("url");
     Outcome outcome;
     if (unregister) {
-        if (!present) return Outcome::NotPresent;
-        root[h.section].erase(opt.name);
+        if (!present && !legacy) return Outcome::NotPresent;
+        if (present) section().erase(opt.name);
+        if (legacy) root[outer].erase(opt.name);
         outcome = Outcome::Removed;
     } else {
         const ordered_json entry = h.entry(opt);
-        if (present && root[h.section][opt.name] == entry) return Outcome::Unchanged;
-        if (root.contains(h.section) && !hasSection) {
-            note = "\"" + std::string(h.section) + "\" in " + path + " is not an object";
+        if (present && !legacy && section()[opt.name] == entry) return Outcome::Unchanged;
+        if ((root.contains(outer) && !hasOuter) ||
+            (!inner.empty() && hasOuter && root[outer].contains(inner) && !hasSection)) {
+            note = "\"" + sectionPath + "\" in " + path + " is not an object";
             return Outcome::Failed;
         }
-        root[h.section][opt.name] = entry;
-        outcome = present ? Outcome::Updated : Outcome::Registered;
+        if (legacy) root[outer].erase(opt.name);
+        section()[opt.name] = entry;
+        outcome = present || legacy ? Outcome::Updated : Outcome::Registered;
     }
     if (comments)
         note = opt.dryRun ? "comments in the file will be dropped (original kept as .ghidra-mcp.bak)"

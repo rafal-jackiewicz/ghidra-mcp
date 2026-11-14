@@ -314,7 +314,7 @@ struct McpDispatch {
         std::string data;
         if (!util::base64Decode(args["content_base64"].get<std::string>(), data))
             return textResult("content_base64 is not valid base64.", true);
-        if (!util::makeDirs(s.cfg_.uploadDir))
+        if (!util::makeDirs(s.cfg_.uploadDir, 0700))
             return textResult("Cannot create " + s.cfg_.uploadDir + ": " + strerror(errno), true);
         std::string path = util::uniquePath(
             s.cfg_.uploadDir, util::safeFileName(args.value("filename", std::string("upload.bin"))));
@@ -486,7 +486,7 @@ bool McpServer::claimUpload(const std::string& ticket, std::string& destPath) {
         fileName = it->second.fileName;
         tickets_.erase(it);
     }
-    if (!util::makeDirs(cfg_.uploadDir)) return false;
+    if (!util::makeDirs(cfg_.uploadDir, 0700)) return false;
     destPath = util::uniquePath(cfg_.uploadDir, fileName);
     return true;
 }

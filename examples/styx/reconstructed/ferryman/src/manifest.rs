@@ -108,6 +108,7 @@ impl<'a> Scanner<'a> {
     /// `%u` (radix 10) and `%x` (radix 16): leading white space, an optional sign, for
     /// hexadecimal an optional `0x`, then at least one digit. A minus sign negates modulo
     /// 2^32, so "-1" becomes 4294967295; scanning stops at the first byte that is no digit.
+    /// A bare `0x` with no digit after it counts as zero: both C libraries read it that way.
     fn unsigned(&mut self, radix: u32) -> Option<u32> {
         self.skip_whitespace();
         let negative = match self.rest {
@@ -121,11 +122,11 @@ impl<'a> Scanner<'a> {
             }
             _ => false,
         };
+        let mut prefixed = false;
         if radix == 16 {
-            if let [b'0', b'x' | b'X', digit, ..] = self.rest {
-                if digit.is_ascii_hexdigit() {
-                    self.rest = &self.rest[2..];
-                }
+            if let [b'0', b'x' | b'X', ..] = self.rest {
+                self.rest = &self.rest[2..];
+                prefixed = true;
             }
         }
         let mut value: u64 = 0;
@@ -135,7 +136,7 @@ impl<'a> Scanner<'a> {
             self.rest = &self.rest[1..];
             digits += 1;
         }
-        if digits == 0 {
+        if digits == 0 && !prefixed {
             return None;
         }
         let value = if negative { value.wrapping_neg() } else { value };
@@ -186,6 +187,8 @@ mod tests {
         assert_eq!(parse(b"Saint;M;-1;a11c37a;0").unwrap().sins, 65535);
         assert_eq!(parse(b"Flags;M;1;a11c37a;258").unwrap().flags, 2);
         assert_eq!(parse(b"Two Words ;M;1;a11c37a;0").unwrap().name_bytes(), b"Two Words ");
+        assert_eq!(parse(b"Bare;M;1;0x;0").unwrap().coin, 0); // found by a reviewer, not by the generator
+        assert!(parse(b"Bare;M;1;0xg;0").is_none());
     }
 
     #[test]

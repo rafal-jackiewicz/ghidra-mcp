@@ -152,13 +152,20 @@ bool Bridge::startLocked(std::string& err) {
     const std::string portFile = runDir_ + "/port";
     std::string portText;
     time_t deadline = time(nullptr) + cfg_.startupTimeoutSec;
+    unsigned polls = 0;
     for (;;) {
         if (util::readFile(portFile, portText) && !portText.empty()) break;
         int status;
         if (waitpid(child_, &status, WNOHANG) == child_.load()) {
             child_ = -1;
-            err = "Ghidra exited during startup. Last lines of " + log + ":\n" +
-                  util::tailOfFile(log, 3000);
+            std::string tail = util::tailOfFile(log, 6000);
+            if (tail.find("Unable to lock project") != std::string::npos)
+                err = "Ghidra exited during startup: the project " + cfg_.projectDir + "/" +
+                      cfg_.projectName + " is in use by another process (the Ghidra window, or "
+                      "another ghidra-mcp). Close it there, or choose another --project-name.";
+            else
+                err = "Ghidra exited during startup. Last lines of " + log + ":\n" +
+                      util::tailOfFile(log, 3000);
             teardownLocked(false);
             return false;
         }
@@ -166,6 +173,19 @@ bool Bridge::startLocked(std::string& err) {
             err = "shutting down";
             teardownLocked(false);
             return false;
+        }
+        // A project that is open elsewhere makes Ghidra report a lock error and then sit there
+        // instead of exiting. Do not wait out the whole timeout for that.
+        if (++polls % 10 == 0) {
+            std::string tail = util::tailOfFile(log, 6000);
+            if (tail.find("LockException") != std::string::npos ||
+                tail.find("Unable to lock project") != std::string::npos) {
+                err = "The Ghidra project " + cfg_.projectDir + "/" + cfg_.projectName +
+                      " is in use by another process (the Ghidra window, or another ghidra-mcp). "
+                      "Close it there, or choose another --project-name.";
+                teardownLocked(false);
+                return false;
+            }
         }
         if (time(nullptr) > deadline) {
             err = "Ghidra did not become ready within " +

@@ -51,7 +51,11 @@ public:
     // Closes all programs and stops Ghidra.
     void stop();
 
-    std::string logPath() const { return cfg_.dataDir + "/ghidra-headless.log"; }
+    // One log per project: two servers of one account then never share a file, because two
+    // servers cannot open the same project.
+    std::string logPath() const {
+        return cfg_.dataDir + "/ghidra-headless-" + cfg_.projectName + ".log";
+    }
 
 private:
     bool startLocked(std::string& err);

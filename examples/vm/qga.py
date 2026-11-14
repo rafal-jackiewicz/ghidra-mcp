@@ -27,7 +27,7 @@ has no network at all.
 The script must run on the machine where QEMU runs, because the agent is reached through a
 Unix socket there (see windows-vm.sh). From another machine, call it through ssh:
 
-    ssh vmhost python3 qga.py exec 'C:\\Legacy\\ferryman.exe' audit 'C:\\Legacy\\evening.ledger'
+    ssh vmhost 'python3 qga.py exec "C:\\Legacy\\ferryman.exe" audit "C:\\Legacy\\evening.ledger"'
 
 The agent serves one client at a time. Every operation here opens the socket briefly and
 closes it again; a long-running program is polled with a fresh connection each time, so
